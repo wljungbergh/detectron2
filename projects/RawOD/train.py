@@ -21,7 +21,10 @@ It also includes fewer abstraction, therefore is easier to add custom logic.
 
 import logging
 import os
+from argparse import ArgumentParser
 from collections import OrderedDict
+from dataclasses import dataclass
+
 import torch
 from torch.nn.parallel import DistributedDataParallel
 
@@ -57,72 +60,68 @@ from detectron2.solver import build_lr_scheduler, build_optimizer
 from detectron2.utils.events import EventStorage
 
 logger = logging.getLogger("detectron2")
-DATASET_NAME = "pascal_raw_{train_or_val}_{raw_or_jpg}_{resolution}"
+DATASET_NAME = "pascal_raw_{train_or_val}_{format}_{resolution}"
 
 
-def register_datasets(raw: bool, resolution: str):
+@dataclass
+class RawODConfig:
+    experiment_name: str
+    format: str = "jpg"
+    resolution: str = "fifth"
+    max_iter: int = 3000
+    batch_size: int = 32
+    lr: float = 0.00025
+    eval_period: int = 1000
 
-    raw_or_jpg = "raw" if raw else "jpg"
+    def __post_init__(self):
+        assert self.format in ["jpg", "grey", "raw"]
+        assert self.resolution in ["fifth", "full"]
+
+
+def add_args(argparser: ArgumentParser) -> ArgumentParser:
+    # add format and resolution
+    argparser.add_argument("--format", type=str, default="jpg")
+    # add resolution
+    argparser.add_argument("--resolution", type=str, default="fifth")
+    # add max_iter
+    argparser.add_argument("--max_iter", type=int, default=3000)
+    # add batch_size
+    argparser.add_argument("--batch_size", type=int, default=32)
+    # add lr
+    argparser.add_argument("--lr", type=float, default=0.00025)
+    # add eval_period
+    argparser.add_argument("--eval_period", type=int, default=1000)
+    # add experiment_name
+    argparser.add_argument("--experiment_name", type=str, required=True)
+
+    return argparser
+
+
+def register_datasets(format: str, resolution: str):
+    assert format in ("raw", "jpg", "grey")
+
+    image_root = f"/datasets/pascal_raw/{resolution}/{format}"
+
+    format_ = "jpg" if format == "grey" else format
+
     for train_or_val in ["train", "val"]:
         register_coco_instances(
             DATASET_NAME.format(
-                train_or_val=train_or_val, raw_or_jpg=raw_or_jpg, resolution=resolution
+                train_or_val=train_or_val, format=format, resolution=resolution
             ),
             {},
-            f"/datasets/pascal_raw/trainval/{resolution}_{train_or_val}_{raw_or_jpg}.json",
-            f"/datasets/pascal_raw/{resolution}/{raw_or_jpg}",
+            f"/datasets/pascal_raw/trainval/{resolution}_{train_or_val}_{format_}.json",
+            image_root,
         )
-
-
-def get_evaluator(cfg, dataset_name, output_folder=None):
-    """
-    Create evaluator(s) for a given dataset.
-    This uses the special metadata "evaluator_type" associated with each builtin dataset.
-    For your own dataset, you can simply create an evaluator manually in your
-    script and do not have to worry about the hacky if-else logic here.
-    """
-    if output_folder is None:
-        output_folder = os.path.join(cfg.OUTPUT_DIR, "inference")
-    evaluator_list = []
-    evaluator_type = MetadataCatalog.get(dataset_name).evaluator_type
-    if evaluator_type in ["sem_seg", "coco_panoptic_seg"]:
-        evaluator_list.append(
-            SemSegEvaluator(
-                dataset_name,
-                distributed=True,
-                output_dir=output_folder,
-            )
-        )
-    if evaluator_type in ["coco", "coco_panoptic_seg"]:
-        evaluator_list.append(COCOEvaluator(dataset_name, output_dir=output_folder))
-    if evaluator_type == "coco_panoptic_seg":
-        evaluator_list.append(COCOPanopticEvaluator(dataset_name, output_folder))
-    if evaluator_type == "cityscapes_instance":
-        return CityscapesInstanceEvaluator(dataset_name)
-    if evaluator_type == "cityscapes_sem_seg":
-        return CityscapesSemSegEvaluator(dataset_name)
-    if evaluator_type == "pascal_voc":
-        return PascalVOCDetectionEvaluator(dataset_name)
-    if evaluator_type == "lvis":
-        return LVISEvaluator(dataset_name, cfg, True, output_folder)
-    if len(evaluator_list) == 0:
-        raise NotImplementedError(
-            "no Evaluator for the dataset {} with the type {}".format(
-                dataset_name, evaluator_type
-            )
-        )
-    if len(evaluator_list) == 1:
-        return evaluator_list[0]
-    return DatasetEvaluators(evaluator_list)
 
 
 def do_test(cfg, model):
     results = OrderedDict()
     for dataset_name in cfg.DATASETS.TEST:
         data_loader = build_detection_test_loader(cfg, dataset_name)
-        evaluator = get_evaluator(
-            cfg, dataset_name, os.path.join(cfg.OUTPUT_DIR, "inference", dataset_name)
-        )
+
+        evaluator = COCOEvaluator(dataset_name, output_dir=cfg.OUTPUT_DIR)
+
         results_i = inference_on_dataset(model, data_loader, evaluator)
         results[dataset_name] = results_i
         if comm.is_main_process():
@@ -142,10 +141,10 @@ def do_train(cfg, model, resume=False):
         model, cfg.OUTPUT_DIR, optimizer=optimizer, scheduler=scheduler
     )
     start_iter = (
-        checkpointer.resume_or_load(cfg.MODEL.WEIGHTS, resume=resume).get(
-            "iteration", -1
-        )
-        + 1
+            checkpointer.resume_or_load(cfg.MODEL.WEIGHTS, resume=resume).get(
+                "iteration", -1
+            )
+            + 1
     )
     max_iter = cfg.SOLVER.MAX_ITER
 
@@ -185,48 +184,81 @@ def do_train(cfg, model, resume=False):
             scheduler.step()
 
             if (
-                cfg.TEST.EVAL_PERIOD > 0
-                and (iteration + 1) % cfg.TEST.EVAL_PERIOD == 0
-                and iteration != max_iter - 1
+                    cfg.TEST.EVAL_PERIOD > 0
+                    and (iteration + 1) % cfg.TEST.EVAL_PERIOD == 0
+                    and iteration != max_iter - 1
             ):
                 do_test(cfg, model)
                 # Compared to "train_net.py", the test results are not dumped to EventStorage
                 comm.synchronize()
 
             if iteration - start_iter > 5 and (
-                (iteration + 1) % 20 == 0 or iteration == max_iter - 1
+                    (iteration + 1) % 20 == 0 or iteration == max_iter - 1
             ):
                 for writer in writers:
                     writer.write()
             periodic_checkpointer.step(iteration)
 
 
-def setup(args):
+def setup(args, run_config: RawODConfig):
     """
     Create configs and perform basic setups.
     """
-    register_datasets(raw=False, resolution="full")
+    # jpg = rgb, grey=grayscale, raw=np.uint16
+    register_datasets(format=run_config.format, resolution=run_config.resolution)
 
     cfg = get_cfg()
     cfg.merge_from_file(args.config_file)
-    cfg.DATASETS.TRAIN = (DATASET_NAME.format(train_or_val="train", raw_or_jpg="jpg", resolution="full"),)
-    cfg.DATASETS.TEST = (DATASET_NAME.format(train_or_val="val", raw_or_jpg="jpg", resolution="full"),)
+    cfg.DATASETS.TRAIN = (
+        DATASET_NAME.format(
+            train_or_val="train",
+            format=run_config.format,
+            resolution=run_config.resolution,
+        ),
+    )
+    cfg.DATASETS.TEST = (
+        DATASET_NAME.format(
+            train_or_val="val",
+            format=run_config.format,
+            resolution=run_config.resolution,
+        ),
+    )
 
+    # set the output directory
+    cfg.OUTPUT_DIR = os.path.join(cfg.OUTPUT_DIR, run_config.experiment_name)
 
-    cfg.SOLVER.IMS_PER_BATCH = 1  # This is the real "batch size" commonly known to deep learning people
-    cfg.SOLVER.BASE_LR = 0.00025  # pick a good LR
-    cfg.SOLVER.MAX_ITER = 300
-    cfg.DATALOADER.NUM_WORKERS = 0
-    cfg.SOLVER.STEPS = []  # do not decay learning rate
-    cfg.MODEL.ROI_HEADS.BATCH_SIZE_PER_IMAGE = 512  # The "RoIHead batch size". 128 is faster, and good enough for this toy dataset (default: 512)
+    # train from scratch
+    cfg.MODEL.WEIGHTS = ""
+
+    if run_config.format == "raw":
+        cfg.MODEL.PIXEL_MEAN = [336.4967]
+        cfg.MODEL.PIXEL_STD = [441.862]
+        cfg.INPUT.FORMAT = "RAW"
+    elif run_config.format == "grey":
+        cfg.MODEL.PIXEL_MEAN = [110.794]
+        cfg.MODEL.PIXEL_STD = [63.426]
+        cfg.INPUT.FORMAT = "GREY"
+    elif run_config.format == "jpg":
+        cfg.MODEL.PIXEL_MEAN = [126.398, 108.167, 83.467]
+        cfg.MODEL.PIXEL_STD = [68.696, 62.867, 60.831]
+        cfg.INPUT.FORMAT = "RGB"
+    else:
+        raise ValueError(f"Unknown format {run_config.format}")
+
+    cfg.SOLVER.IMS_PER_BATCH = run_config.batch_size  # batch_size
+
+    cfg.SOLVER.BASE_LR = run_config.lr
+    cfg.SOLVER.MAX_ITER = run_config.max_iter
+    # set the validation period to 5000 iterations
+    cfg.TEST.EVAL_PERIOD = run_config.eval_period
+
+    cfg.DATALOADER.NUM_WORKERS = 2
+
+    cfg.SOLVER.STEPS = [int(0.8 * run_config.max_iter)]
+    cfg.SOLVER.GAMMA = 0.5
+    cfg.MODEL.ROI_HEADS.BATCH_SIZE_PER_IMAGE = 512
     cfg.MODEL.ROI_HEADS.NUM_CLASSES = 3
-    cfg.INPUT.MIN_SIZE_TRAIN = (4000,) #(3000, 3500, 4000,)
-    cfg.INPUT.MAX_SIZE_TRAIN = 6016
-    cfg.INPUT.MIN_SIZE_TEST = (4000,)
-    cfg.INPUT.MAX_SIZE_TEST = 6016
-
-    #cfg.INPUT.
-
+    cfg.INPUT.MIN_SIZE_TRAIN = cfg.INPUT.MIN_SIZE_TEST = (802,)
 
     cfg.freeze()
     default_setup(
@@ -235,8 +267,8 @@ def setup(args):
     return cfg
 
 
-def main(args):
-    cfg = setup(args)
+def main(args, run_config: RawODConfig):
+    cfg = setup(args, run_config)
 
     model = build_model(cfg)
     logger.info("Model:\n{}".format(model))
@@ -257,14 +289,19 @@ def main(args):
 
 
 if __name__ == "__main__":
-    args = default_argument_parser().parse_args()
+    parser = default_argument_parser()
+    parser = add_args(parser)
+    args = parser.parse_args()
+
+    run_config = RawODConfig(
+        experiment_name=args.experiment_name,
+        format=args.format,
+        resolution=args.resolution,
+        max_iter=args.max_iter,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        eval_period=args.eval_period,
+    )
+
     print("Command Line Args:", args)
-    main(args)
-    # launch(
-    #     main,
-    #     args.num_gpus,
-    #     num_machines=args.num_machines,
-    #     machine_rank=args.machine_rank,
-    #     dist_url=args.dist_url,
-    #     args=(args,),
-    # )
+    main(args, run_config)

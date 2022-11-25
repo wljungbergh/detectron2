@@ -185,6 +185,21 @@ def read_image(file_name, format=None):
         return convert_PIL_to_numpy(image, format)
 
 
+def read_image_custom(file_name, format=None):
+    if format == "RAW":
+        image = np.load(file_name).astype(np.float32)
+    elif format in ("GREY", "RGB"):
+        with PathManager.open(file_name, "rb") as f:
+            image = Image.open(f)
+            image = np.asarray(image)
+    else:
+        raise ValueError("Unsupported format: {}".format(format))
+
+    if len(image.shape) == 2:
+        image = np.expand_dims(image, -1)
+    return image
+
+
 def check_image_size(dataset_dict, image):
     """
     Raise an error if the image does not match the size specified in the dict.
@@ -255,7 +270,7 @@ def transform_proposals(dataset_dict, image_shape, transforms, *, proposal_topk,
 
 
 def transform_instance_annotations(
-    annotation, transforms, image_size, *, keypoint_hflip_indices=None
+        annotation, transforms, image_size, *, keypoint_hflip_indices=None
 ):
     """
     Apply transforms to box, segmentation and keypoints annotations of a single instance.
@@ -471,7 +486,7 @@ def annotations_to_instances_rotated(annos, image_size):
 
 
 def filter_empty_instances(
-    instances, by_box=True, by_mask=True, box_threshold=1e-5, return_mask=False
+        instances, by_box=True, by_mask=True, box_threshold=1e-5, return_mask=False
 ):
     """
     Filter out empty instances in an `Instances` object.
@@ -569,10 +584,10 @@ def gen_crop_transform_with_instance(crop_size, image_size, instance):
     bbox = BoxMode.convert(instance["bbox"], instance["bbox_mode"], BoxMode.XYXY_ABS)
     center_yx = (bbox[1] + bbox[3]) * 0.5, (bbox[0] + bbox[2]) * 0.5
     assert (
-        image_size[0] >= center_yx[0] and image_size[1] >= center_yx[1]
+            image_size[0] >= center_yx[0] and image_size[1] >= center_yx[1]
     ), "The annotation bounding box is outside of the image!"
     assert (
-        image_size[0] >= crop_size[0] and image_size[1] >= crop_size[1]
+            image_size[0] >= crop_size[0] and image_size[1] >= crop_size[1]
     ), "Crop size is larger than image size!"
 
     min_yx = np.maximum(np.floor(center_yx).astype(np.int32) - crop_size, 0)
