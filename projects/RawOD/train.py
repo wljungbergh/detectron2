@@ -68,13 +68,14 @@ class RawODConfig:
     experiment_name: str
     format: str = "jpg"
     resolution: str = "fifth"
-    max_iter: int = 3000
-    batch_size: int = 32
+    max_iter: int = 5000
+    batch_size: int = 16
     lr: float = 0.00025
-    eval_period: int = 1000
+    eval_period: int = 1500
+    pretrained: bool = False
 
     def __post_init__(self):
-        assert self.format in ["jpg", "grey", "raw"]
+        assert self.format in ["jpg", "grey", "raw"], f"Invalid format: {self.format}"
         assert self.resolution in ["fifth", "full"]
 
 
@@ -93,6 +94,9 @@ def add_args(argparser: ArgumentParser) -> ArgumentParser:
     argparser.add_argument("--eval_period", type=int, default=1000)
     # add experiment_name
     argparser.add_argument("--experiment_name", type=str, required=True)
+    # add pretrained
+    argparser.add_argument("--pretrained", action="store_true")
+
 
     return argparser
 
@@ -228,7 +232,10 @@ def setup(args, run_config: RawODConfig):
     cfg.OUTPUT_DIR = os.path.join(cfg.OUTPUT_DIR, run_config.experiment_name)
 
     # train from scratch
-    cfg.MODEL.WEIGHTS = ""
+    if run_config.pretrained and run_config.format == "jpg":
+        cfg.MODEL.WEIGHTS = "projects/RawOD/weights/model_final_b275ba.pkl"
+    else:
+        cfg.MODEL.WEIGHTS = ""
 
     if run_config.format == "raw":
         cfg.MODEL.PIXEL_MEAN = [336.4967]
