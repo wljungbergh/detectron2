@@ -32,7 +32,6 @@ import detectron2.utils.comm as comm
 from detectron2.checkpoint import DetectionCheckpointer, PeriodicCheckpointer
 from detectron2.config import get_cfg
 from detectron2.data import (
-    MetadataCatalog,
     build_detection_test_loader,
     build_detection_train_loader,
 )
@@ -44,14 +43,7 @@ from detectron2.engine import (
     launch,
 )
 from detectron2.evaluation import (
-    CityscapesInstanceEvaluator,
-    CityscapesSemSegEvaluator,
     COCOEvaluator,
-    COCOPanopticEvaluator,
-    DatasetEvaluators,
-    LVISEvaluator,
-    PascalVOCDetectionEvaluator,
-    SemSegEvaluator,
     inference_on_dataset,
     print_csv_format,
 )
@@ -60,7 +52,8 @@ from detectron2.solver import build_lr_scheduler, build_optimizer
 from detectron2.utils.events import EventStorage
 
 logger = logging.getLogger("detectron2")
-DATASET_NAME = "pascal_raw_{train_or_val}_{format}_{resolution}"
+PASCAL_DATASET_NAME = "pascal_raw_{train_or_val}_{format}_{resolution}"
+NOD_DATASET_NAME = "nod_raw_{camera}_{train_or_val}_{raw_or_jpg}"
 
 
 @dataclass
@@ -68,58 +61,89 @@ class RawODConfig:
     experiment_name: str
     format: str = "jpg"
     resolution: str = "fifth"
-    max_iter: int = 5000
+    max_iter: int = 100_000
     batch_size: int = 16
-    lr: float = 0.00025
-    eval_period: int = 1500
+    lr: float = 3e-4
+    eval_period: int = 5000
     pretrained: bool = False
-
-    def __post_init__(self):
-        assert self.format in ["jpg", "grey", "raw"], f"Invalid format: {self.format}"
-        assert self.resolution in ["fifth", "full"]
+    nod_dataset: bool = False
 
 
 def add_args(argparser: ArgumentParser) -> ArgumentParser:
     # add format and resolution
-    argparser.add_argument("--format", type=str, default="jpg")
+    argparser.add_argument("--format", type=str)
     # add resolution
-    argparser.add_argument("--resolution", type=str, default="fifth")
+    argparser.add_argument("--resolution", type=str)
     # add max_iter
-    argparser.add_argument("--max_iter", type=int, default=3000)
+    argparser.add_argument("--max_iter", type=int)
     # add batch_size
-    argparser.add_argument("--batch_size", type=int, default=32)
+    argparser.add_argument("--batch_size", type=int)
     # add lr
-    argparser.add_argument("--lr", type=float, default=0.00025)
+    argparser.add_argument("--lr", type=float)
     # add eval_period
-    argparser.add_argument("--eval_period", type=int, default=1000)
+    argparser.add_argument("--eval_period", type=int)
     # add experiment_name
     argparser.add_argument("--experiment_name", type=str, required=True)
     # add pretrained
     argparser.add_argument("--pretrained", action="store_true")
-
+    # add nod_dataset
+    argparser.add_argument("--nod_dataset", action="store_true")
 
     return argparser
 
 
 def register_datasets(format: str, resolution: str):
-    assert format in ("raw", "jpg", "grey")
-
-    image_root = f"/datasets/pascal_raw/{resolution}/{format}"
-
-    format_ = "jpg" if format == "grey" else format
+    if "raw" in format:
+        linear = "linear_" if "linear" in format else ""
+        json_path = "/datasets/pascal_raw/trainval/{resolution}_{train_or_val}_raw.json"
+        image_root = f"/datasets/pascal_raw/{resolution}/{linear}raw"
+    elif "jpg" in format:
+        downsampled = "downsampled_" if "downsampled" in format else ""
+        json_path = "/datasets/pascal_raw/trainval/{resolution}_{train_or_val}_jpg.json"
+        image_root = f"/datasets/pascal_raw/{resolution}/{downsampled}jpg"
+    elif "grey" in format:
+        json_path = "/datasets/pascal_raw/trainval/{resolution}_{train_or_val}_jpg.json"
+        image_root = f"/datasets/pascal_raw/{resolution}/{format}"
+    else:
+        raise ValueError(f"Unknown format: {format}")
 
     for train_or_val in ["train", "val"]:
         register_coco_instances(
-            DATASET_NAME.format(
+            PASCAL_DATASET_NAME.format(
                 train_or_val=train_or_val, format=format, resolution=resolution
             ),
             {},
-            f"/datasets/pascal_raw/trainval/{resolution}_{train_or_val}_{format_}.json",
+            json_path.format(resolution=resolution, train_or_val=train_or_val),
             image_root,
         )
 
 
-def do_test(cfg, model):
+def register_nod_datasets(format: str):
+    nod_raw_root = "/datasets/nod_raw"
+
+    if "raw" in format:
+        raw_or_jpg = "raw"
+    elif "jpg" in format:
+        raw_or_jpg = "jpg"
+
+    for camera, resolution in [("nikon", "third"), ("sony", "fifth")]:
+        for train_or_val in ["train", "val"]:
+            register_coco_instances(
+                name=NOD_DATASET_NAME.format(
+                    camera=camera, train_or_val=train_or_val, raw_or_jpg=raw_or_jpg
+                ),
+                metadata={},
+                json_file=os.path.join(
+                    nod_raw_root,
+                    camera,
+                    "annotations",
+                    f"{camera}_{train_or_val}_{raw_or_jpg}.json",
+                ),
+                image_root=os.path.join(nod_raw_root, camera, resolution, raw_or_jpg),
+            )
+
+
+def do_test(cfg, model, storage=None):
     results = OrderedDict()
     for dataset_name in cfg.DATASETS.TEST:
         data_loader = build_detection_test_loader(cfg, dataset_name)
@@ -131,6 +155,13 @@ def do_test(cfg, model):
         if comm.is_main_process():
             logger.info("Evaluation results for {} in csv format:".format(dataset_name))
             print_csv_format(results_i)
+
+        if storage is not None:
+            for k, v in results_i["bbox"].items():
+                if k in ("APs", "APm", "APl"):
+                    continue
+                storage.put_scalar(k, v, smoothing_hint=False)
+
     if len(results) == 1:
         results = list(results.values())[0]
     return results
@@ -145,10 +176,10 @@ def do_train(cfg, model, resume=False):
         model, cfg.OUTPUT_DIR, optimizer=optimizer, scheduler=scheduler
     )
     start_iter = (
-            checkpointer.resume_or_load(cfg.MODEL.WEIGHTS, resume=resume).get(
-                "iteration", -1
-            )
-            + 1
+        checkpointer.resume_or_load(cfg.MODEL.WEIGHTS, resume=resume).get(
+            "iteration", -1
+        )
+        + 1
     )
     max_iter = cfg.SOLVER.MAX_ITER
 
@@ -167,7 +198,6 @@ def do_train(cfg, model, resume=False):
     with EventStorage(start_iter) as storage:
         for data, iteration in zip(data_loader, range(start_iter, max_iter)):
             storage.iter = iteration
-
             loss_dict = model(data)
             losses = sum(loss_dict.values())
             assert torch.isfinite(losses).all(), loss_dict
@@ -188,20 +218,63 @@ def do_train(cfg, model, resume=False):
             scheduler.step()
 
             if (
-                    cfg.TEST.EVAL_PERIOD > 0
-                    and (iteration + 1) % cfg.TEST.EVAL_PERIOD == 0
-                    and iteration != max_iter - 1
+                cfg.TEST.EVAL_PERIOD > 0
+                and (iteration + 1) % cfg.TEST.EVAL_PERIOD == 0
+                and iteration != max_iter - 1
             ):
-                do_test(cfg, model)
+                do_test(cfg, model, storage)
                 # Compared to "train_net.py", the test results are not dumped to EventStorage
                 comm.synchronize()
 
             if iteration - start_iter > 5 and (
-                    (iteration + 1) % 20 == 0 or iteration == max_iter - 1
+                (iteration + 1) % 20 == 0 or iteration == max_iter - 1
             ):
                 for writer in writers:
                     writer.write()
             periodic_checkpointer.step(iteration)
+
+
+def set_datasets(cfg, run_config: RawODConfig):
+    if run_config.nod_dataset:
+        cfg.DATASETS.TRAIN = (
+            NOD_DATASET_NAME.format(
+                train_or_val="train",
+                camera="nikon",
+                raw_or_jpg="raw" if "raw" in run_config.format else "jpg",
+            ),
+            NOD_DATASET_NAME.format(
+                train_or_val="train",
+                camera="sony",
+                raw_or_jpg="raw" if "raw" in run_config.format else "jpg",
+            ),
+        )
+        cfg.DATASETS.TEST = (
+            NOD_DATASET_NAME.format(
+                train_or_val="val",
+                camera="nikon",
+                raw_or_jpg="raw" if "raw" in run_config.format else "jpg",
+            ),
+            NOD_DATASET_NAME.format(
+                train_or_val="val",
+                camera="sony",
+                raw_or_jpg="raw" if "raw" in run_config.format else "jpg",
+            ),
+        )
+    else:
+        cfg.DATASETS.TRAIN = (
+            PASCAL_DATASET_NAME.format(
+                train_or_val="train",
+                format=run_config.format,
+                resolution=run_config.resolution,
+            ),
+        )
+        cfg.DATASETS.TEST = (
+            PASCAL_DATASET_NAME.format(
+                train_or_val="val",
+                format=run_config.format,
+                resolution=run_config.resolution,
+            ),
+        )
 
 
 def setup(args, run_config: RawODConfig):
@@ -210,62 +283,93 @@ def setup(args, run_config: RawODConfig):
     """
     # jpg = rgb, grey=grayscale, raw=np.uint16
     register_datasets(format=run_config.format, resolution=run_config.resolution)
+    register_nod_datasets(run_config.format)
 
     cfg = get_cfg()
     cfg.merge_from_file(args.config_file)
-    cfg.DATASETS.TRAIN = (
-        DATASET_NAME.format(
-            train_or_val="train",
-            format=run_config.format,
-            resolution=run_config.resolution,
-        ),
-    )
-    cfg.DATASETS.TEST = (
-        DATASET_NAME.format(
-            train_or_val="val",
-            format=run_config.format,
-            resolution=run_config.resolution,
-        ),
-    )
 
-    # set the output directory
-    cfg.OUTPUT_DIR = os.path.join(cfg.OUTPUT_DIR, run_config.experiment_name)
+    set_datasets(cfg, run_config)
 
-    # train from scratch
-    if run_config.pretrained and run_config.format == "jpg":
-        cfg.MODEL.WEIGHTS = "projects/RawOD/weights/model_final_b275ba.pkl"
-    else:
-        cfg.MODEL.WEIGHTS = ""
-
-    if run_config.format == "raw":
-        cfg.MODEL.PIXEL_MEAN = [336.4967]
-        cfg.MODEL.PIXEL_STD = [441.862]
-        cfg.INPUT.FORMAT = "RAW"
-    elif run_config.format == "grey":
-        cfg.MODEL.PIXEL_MEAN = [110.794]
-        cfg.MODEL.PIXEL_STD = [63.426]
-        cfg.INPUT.FORMAT = "GREY"
-    elif run_config.format == "jpg":
-        cfg.MODEL.PIXEL_MEAN = [126.398, 108.167, 83.467]
-        cfg.MODEL.PIXEL_STD = [68.696, 62.867, 60.831]
-        cfg.INPUT.FORMAT = "RGB"
-    else:
-        raise ValueError(f"Unknown format {run_config.format}")
-
+    # Basic setup
     cfg.SOLVER.IMS_PER_BATCH = run_config.batch_size  # batch_size
-
+    # set the warmup
+    cfg.SOLVER.WARMUP_FACTOR = 0.001
+    cfg.SOLVER.WARMUP_ITERS = 5000
     cfg.SOLVER.BASE_LR = run_config.lr
     cfg.SOLVER.MAX_ITER = run_config.max_iter
     # set the validation period to 5000 iterations
     cfg.TEST.EVAL_PERIOD = run_config.eval_period
-
-    cfg.DATALOADER.NUM_WORKERS = 2
-
-    cfg.SOLVER.STEPS = [int(0.8 * run_config.max_iter)]
-    cfg.SOLVER.GAMMA = 0.5
+    cfg.DATALOADER.NUM_WORKERS = 16
+    cfg.SOLVER.STEPS = [
+        int(0.8 * run_config.max_iter),
+    ]
+    cfg.SOLVER.GAMMA = 0.1
     cfg.MODEL.ROI_HEADS.BATCH_SIZE_PER_IMAGE = 512
     cfg.MODEL.ROI_HEADS.NUM_CLASSES = 3
-    cfg.INPUT.MIN_SIZE_TRAIN = cfg.INPUT.MIN_SIZE_TEST = (802,)
+    cfg.MODEL.RETINANET.NUM_CLASSES = 3
+
+    # settings that are importatnt for the raw data, the rgb should have the same settings
+    # ps. trying out these new settings to see if augmentations helps even though the do not make
+    # sense for raw data
+    cfg.INPUT.MIN_SIZE_TRAIN = (480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800)
+    cfg.INPUT.MIN_SIZE_TEST = (802,)
+    cfg.INPUT.RANDOM_FLIP = "horizontal"
+    cfg.INPUT.CROP.ENABLED = True
+    cfg.INPUT.CROP.TYPE = "relative_range"
+    cfg.INPUT.CROP.SIZE = [0.9, 0.9]
+
+    # # set the optimizer to AdamW
+    # cfg.SOLVER.OPTIMIZER = "AdamW"
+    # cfg.SOLVER.BIAS_LR_FACTOR = 2.0
+    # cfg.SOLVER.WEIGHT_DECAY = 0.0001
+    # cfg.SOLVER.WEIGHT_DECAY_BIAS = 0.0001
+    # cfg.SOLVER.MOMENTUM = 0.9
+    # cfg.SOLVER.ADAM_EPS = 1e-8
+    # cfg.SOLVER.ADAM_BETAS = (0.9, 0.999)
+
+    # set the output directory
+    cfg.OUTPUT_DIR = os.path.join(
+        cfg.OUTPUT_DIR, "experimental_setup_04/with_augs", run_config.experiment_name
+    )
+
+    # train from scratch
+    if run_config.pretrained:
+        cfg.MODEL.WEIGHTS = (
+            "projects/RawvOD/weights/model_final_b275ba_no_first_layer.pkl"
+        )
+    else:
+        cfg.MODEL.WEIGHTS = ""
+        cfg.MODEL.BACKBONE.FREEZE_AT = 0
+
+    if "raw" in run_config.format:
+        # these are removed prior to training. Note that the length of this list vector is used to initialize the
+        # first layer of the model, hence we need different depending on what tpye is used.
+        if "reshape" in run_config.format:
+            cfg.MODEL.PIXEL_MEAN = [0.0] * 4
+            cfg.MODEL.PIXEL_STD = [1.0] * 4
+        elif "plain" in run_config.format:
+            cfg.MODEL.PIXEL_MEAN = [0.0]
+            cfg.MODEL.PIXEL_STD = [1.0]
+        elif "offset" in run_config.format:
+            cfg.MODEL.PIXEL_MEAN = [0.0] * 4
+            cfg.MODEL.PIXEL_STD = [1.0] * 4
+        elif "rgb" in run_config.format:
+            cfg.MODEL.PIXEL_MEAN = [0.0] * 3
+            cfg.MODEL.PIXEL_STD = [1.0] * 3
+        else:
+            raise NotImplementedError("Unknown format: {}".format(run_config.format))
+
+        cfg.INPUT.FORMAT = run_config.format
+    elif run_config.format == "grey":
+        cfg.MODEL.PIXEL_MEAN = [110.794]
+        cfg.MODEL.PIXEL_STD = [63.426]
+        cfg.INPUT.FORMAT = run_config.format
+    elif "jpg" in run_config.format:
+        cfg.MODEL.PIXEL_MEAN = [126.398, 108.167, 83.467]
+        cfg.MODEL.PIXEL_STD = [68.696, 62.867, 60.831]
+        cfg.INPUT.FORMAT = run_config.format
+    else:
+        raise ValueError(f"Unknown format {run_config.format}")
 
     cfg.freeze()
     default_setup(
@@ -299,15 +403,13 @@ if __name__ == "__main__":
     parser = default_argument_parser()
     parser = add_args(parser)
     args = parser.parse_args()
-
+    # create the run cofnig for the arument names that exists in RawODConfig
     run_config = RawODConfig(
-        experiment_name=args.experiment_name,
-        format=args.format,
-        resolution=args.resolution,
-        max_iter=args.max_iter,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        eval_period=args.eval_period,
+        **{
+            k: v
+            for k, v in vars(args).items()
+            if k in RawODConfig.__dataclass_fields__ and v is not None
+        }
     )
 
     print("Command Line Args:", args)

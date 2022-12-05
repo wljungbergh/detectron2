@@ -120,6 +120,11 @@ class DatasetMapper:
             if not self.use_keypoint:
                 anno.pop("keypoints", None)
 
+        # we resize the image from HxWx1 -> H/2 x W/2 x 4, but the output should still yield the
+        # same bounding boxes
+        if "reshape" in self.image_format:
+            transforms.transforms = [t for t in transforms.transforms if not isinstance(t, T.ResizeTransform)]
+
         # USER: Implement additional transformations if you have other types of data
         annos = [
             utils.transform_instance_annotations(
@@ -152,7 +157,8 @@ class DatasetMapper:
         dataset_dict = copy.deepcopy(dataset_dict)  # it will be modified by code below
         # USER: Write your own image loading if it's not from a file
         image = utils.read_image_custom(dataset_dict["file_name"], format=self.image_format)
-        utils.check_image_size(dataset_dict, image)
+        factor = 2 if "reshape" in self.image_format else 1
+        utils.check_image_size(dataset_dict, image, factor)
 
         # USER: Remove if you don't do semantic/panoptic segmentation.
         if "sem_seg_file_name" in dataset_dict:
