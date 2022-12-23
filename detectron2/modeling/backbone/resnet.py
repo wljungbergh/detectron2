@@ -1,5 +1,7 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
 import numpy as np
+
+from detectron2.layers.learnable_isp import LearnableISP
 import fvcore.nn.weight_init as weight_init
 import torch
 import torch.nn.functional as F
@@ -333,7 +335,17 @@ class BasicStem(CNNBlockBase):
     with a conv, relu and max_pool.
     """
 
-    def __init__(self, in_channels=3, out_channels=64, norm="BN"):
+    def __init__(
+        self,
+        in_channels=3,
+        out_channels=64,
+        norm="BN",
+        use_normalize=True,
+        use_yeojohnson=True,
+        use_gamma=True,
+        use_erf=True,
+        normalize_with_max=True,
+    ):
         """
         Args:
             norm (str or callable): norm after the first conv layer.
@@ -352,7 +364,16 @@ class BasicStem(CNNBlockBase):
         )
         weight_init.c2_msra_fill(self.conv1)
 
+        self.learnable_isp = LearnableISP(
+            use_normalize=use_normalize,
+            use_yeojohnson=use_yeojohnson,
+            use_gamma=use_gamma,
+            use_erf=use_erf,
+            normalize_with_max=normalize_with_max,
+        )
+
     def forward(self, x):
+        x = self.learnable_isp(x)
         x = self.conv1(x)
         x = F.relu_(x)
         x = F.max_pool2d(x, kernel_size=3, stride=2, padding=1)
@@ -638,6 +659,11 @@ def build_resnet_backbone(cfg, input_shape):
         in_channels=input_shape.channels,
         out_channels=cfg.MODEL.RESNETS.STEM_OUT_CHANNELS,
         norm=norm,
+        use_normalize=cfg.MODEL.RESNETS.USE_NORMALIZE,
+        use_yeojohnson=cfg.MODEL.RESNETS.USE_YEOJOHNSON,
+        use_gamma=cfg.MODEL.RESNETS.USE_GAMMA,
+        use_erf=cfg.MODEL.RESNETS.USE_ERF,
+        normalize_with_max=cfg.MODEL.RESNETS.NORMALIZE_WITH_MAX,
     )
 
     # fmt: off

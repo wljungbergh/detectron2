@@ -61,12 +61,17 @@ class RawODConfig:
     experiment_name: str
     format: str = "jpg"
     resolution: str = "fifth"
-    max_iter: int = 100_000
+    max_iter: int = 150_000
     batch_size: int = 16
     lr: float = 3e-4
     eval_period: int = 5000
     pretrained: bool = False
     nod_dataset: bool = False
+    use_normalize: bool = False
+    use_yeojohnson: bool = False
+    use_gamma: bool = False
+    use_erf: bool = False
+    normalize_with_max: bool = False
 
 
 def add_args(argparser: ArgumentParser) -> ArgumentParser:
@@ -88,6 +93,16 @@ def add_args(argparser: ArgumentParser) -> ArgumentParser:
     argparser.add_argument("--pretrained", action="store_true")
     # add nod_dataset
     argparser.add_argument("--nod_dataset", action="store_true")
+    # add use_normalize
+    argparser.add_argument("--use_normalize", action="store_true")
+    # add use_yeojohnson
+    argparser.add_argument("--use_yeojohnson", action="store_true")
+    # add use_gamma
+    argparser.add_argument("--use_gamma", action="store_true")
+    # add use_erf
+    argparser.add_argument("--use_erf", action="store_true")
+    # add normalize_with_max
+    argparser.add_argument("--normalize_with_max", action="store_true")
 
     return argparser
 
@@ -213,8 +228,26 @@ def do_train(cfg, model, resume=False):
             losses.backward()
             optimizer.step()
             storage.put_scalar(
-                "lr", optimizer.param_groups[0]["lr"], smoothing_hint=False
+                "params/lambda",
+                model.backbone.bottom_up.stem.learnable_isp.lambda_param.item(),
+                smoothing_hint=False,
             )
+            storage.put_scalar(
+                "params/gamma",
+                model.backbone.bottom_up.stem.learnable_isp.gamma_param.item(),
+                smoothing_hint=False,
+            )
+            storage.put_scalar(
+                "params/mu",
+                model.backbone.bottom_up.stem.learnable_isp.mu_param.item(),
+                smoothing_hint=False,
+            )
+            storage.put_scalar(
+                "params/sigma",
+                model.backbone.bottom_up.stem.learnable_isp.sigma_param.item(),
+                smoothing_hint=False,
+            )
+
             scheduler.step()
 
             if (
@@ -301,7 +334,7 @@ def setup(args, run_config: RawODConfig):
     cfg.TEST.EVAL_PERIOD = run_config.eval_period
     cfg.DATALOADER.NUM_WORKERS = 16
     cfg.SOLVER.STEPS = [
-        int(0.8 * run_config.max_iter),
+        int(0.7 * run_config.max_iter),
     ]
     cfg.SOLVER.GAMMA = 0.1
     cfg.MODEL.ROI_HEADS.BATCH_SIZE_PER_IMAGE = 512
@@ -311,26 +344,29 @@ def setup(args, run_config: RawODConfig):
     # settings that are importatnt for the raw data, the rgb should have the same settings
     # ps. trying out these new settings to see if augmentations helps even though the do not make
     # sense for raw data
-    cfg.INPUT.MIN_SIZE_TRAIN = (480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800)
-    cfg.INPUT.MIN_SIZE_TEST = (802,)
-    cfg.INPUT.RANDOM_FLIP = "horizontal"
-    cfg.INPUT.CROP.ENABLED = True
-    cfg.INPUT.CROP.TYPE = "relative_range"
-    cfg.INPUT.CROP.SIZE = [0.9, 0.9]
-
-    # # set the optimizer to AdamW
-    # cfg.SOLVER.OPTIMIZER = "AdamW"
-    # cfg.SOLVER.BIAS_LR_FACTOR = 2.0
-    # cfg.SOLVER.WEIGHT_DECAY = 0.0001
-    # cfg.SOLVER.WEIGHT_DECAY_BIAS = 0.0001
-    # cfg.SOLVER.MOMENTUM = 0.9
-    # cfg.SOLVER.ADAM_EPS = 1e-8
-    # cfg.SOLVER.ADAM_BETAS = (0.9, 0.999)
+    cfg.INPUT.MIN_SIZE_TRAIN = (802,) if not run_config.nod_dataset else (880,)
+    cfg.INPUT.MIN_SIZE_TEST = (802,) if not run_config.nod_dataset else (880,)
+    # remove horizontal flip
+    cfg.INPUT.RANDOM_FLIP = "none"
 
     # set the output directory
     cfg.OUTPUT_DIR = os.path.join(
-        cfg.OUTPUT_DIR, "experimental_setup_04/with_augs", run_config.experiment_name
+        cfg.OUTPUT_DIR,
+        f"{'nod_' if run_config.nod_dataset else ''}learnable_isp_02_zprod",
+        run_config.experiment_name,
     )
+    if "raw" in run_config.format:
+        cfg.MODEL.RESNETS.USE_NORMALIZE = run_config.use_normalize
+        cfg.MODEL.RESNETS.USE_YEOJOHNSON = run_config.use_yeojohnson
+        cfg.MODEL.RESNETS.USE_GAMMA = run_config.use_gamma
+        cfg.MODEL.RESNETS.USE_ERF = run_config.use_erf
+        cfg.MODEL.RESNETS.NORMALIZE_WITH_MAX = run_config.normalize_with_max
+    else:
+        cfg.MODEL.RESNETS.USE_NORMALIZE = False
+        cfg.MODEL.RESNETS.USE_YEOJOHNSON = False
+        cfg.MODEL.RESNETS.USE_GAMMA = False
+        cfg.MODEL.RESNETS.USE_ERF = False
+        cfg.MODEL.RESNETS.NORMALIZE_WITH_MAX = False
 
     # train from scratch
     if run_config.pretrained:
@@ -348,8 +384,8 @@ def setup(args, run_config: RawODConfig):
             cfg.MODEL.PIXEL_MEAN = [0.0] * 4
             cfg.MODEL.PIXEL_STD = [1.0] * 4
         elif "plain" in run_config.format:
-            cfg.MODEL.PIXEL_MEAN = [0.0]
-            cfg.MODEL.PIXEL_STD = [1.0]
+            cfg.MODEL.PIXEL_MEAN = [0.0] * 3
+            cfg.MODEL.PIXEL_STD = [1.0] * 3
         elif "offset" in run_config.format:
             cfg.MODEL.PIXEL_MEAN = [0.0] * 4
             cfg.MODEL.PIXEL_STD = [1.0] * 4
